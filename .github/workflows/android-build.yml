@@ -38,10 +38,19 @@ jobs:
           if [ ${#projects[@]} -eq 0 ]; then
             echo "No settings.gradle.kts found. Files present:"; ls -R | head -50; exit 1
           fi
+          # Longer network timeouts and retries: dependency downloads occasionally fail on the runner.
+          opts=(-Dorg.gradle.internal.http.connectionTimeout=120000 -Dorg.gradle.internal.http.socketTimeout=120000
+                -Dorg.gradle.internal.repository.max.retries=6 -Dorg.gradle.internal.repository.initial.backoff=2000)
           for p in "${projects[@]}"; do
             echo "::group::Building $p"
-            gradle -p "$p" assembleDebug --stacktrace
+            ok=0
+            for attempt in 1 2 3; do
+              extra=(); [ "$attempt" -gt 1 ] && extra=(--refresh-dependencies)
+              if gradle -p "$p" assembleDebug --stacktrace "${opts[@]}" "${extra[@]}"; then ok=1; break; fi
+              echo "Attempt $attempt failed for $p; retrying in 20s"; sleep 20
+            done
             echo "::endgroup::"
+            [ "$ok" = 1 ] || { echo "Build failed for $p after 3 attempts"; exit 1; }
           done
 
       - name: Collect APKs
