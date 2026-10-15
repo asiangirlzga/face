@@ -1,0 +1,60 @@
+name: Build Android APKs
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # Chaquopy (Python on Android) needs a build-machine Python that matches the app's Python (3.10).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # ubuntu-latest already includes the Android SDK (ANDROID_HOME).
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      # The projects have no Gradle wrapper, so install Gradle directly.
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      # Builds every Gradle project in the repo (client app and/or phone server app).
+      - name: Build debug APKs
+        run: |
+          mapfile -t projects < <(find . -name settings.gradle.kts -not -path '*/.git/*' -not -path '*/build/*' | xargs -n1 dirname)
+          if [ ${#projects[@]} -eq 0 ]; then
+            echo "No settings.gradle.kts found. Files present:"; ls -R | head -50; exit 1
+          fi
+          for p in "${projects[@]}"; do
+            echo "::group::Building $p"
+            gradle -p "$p" assembleDebug --stacktrace
+            echo "::endgroup::"
+          done
+
+      - name: Collect APKs
+        run: |
+          mkdir -p apks
+          find . -path '*/build/outputs/apk/debug/*.apk' -not -path './apks/*' | while read -r f; do
+            proj=$(echo "$f" | sed -E 's#^\./##; s#/?app/build/outputs/apk/debug/.*##; s#/#_#g')
+            cp "$f" "apks/${proj:-app}-$(basename "$f")"
+          done
+          ls -l apks
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: faceswap-apks
+          path: apks/*.apk
+          if-no-files-found: error
