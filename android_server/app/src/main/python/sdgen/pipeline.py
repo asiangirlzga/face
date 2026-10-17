@@ -20,7 +20,7 @@ import time
 import cv2
 import numpy as np
 
-from . import scheduler
+from . import onnx_probe, scheduler
 from .tokenizer import ClipTokenizer
 
 VAE_SCALE = 0.18215
@@ -99,6 +99,12 @@ def _to_bytes(arr):
         return bytes((b & 0xFF) for b in arr)
 
 
+def _c(arr, dtype=None):
+    """C-contiguous array of the given dtype; unlike np.ascontiguousarray it keeps 0-d (scalar) arrays 0-d."""
+    a = np.asarray(arr, dtype=dtype)
+    return a if a.flags["C_CONTIGUOUS"] else np.array(a, order="C")
+
+
 class AndroidOrtGeneric:
     """Calls com.example.faceswapserver.OrtBridge (Kotlin) through Chaquopy."""
 
@@ -122,7 +128,7 @@ class AndroidOrtGeneric:
         from java import jarray
         self._b.feedClear()
         for key, arr in feeds.items():
-            arr = np.ascontiguousarray(arr)
+            arr = _c(arr)
             self._b.feed(key, arr.dtype.name, arr.tobytes(), jarray("J")([int(s) for s in arr.shape]))
         res = self._b.runFeed(name)
         return [np.frombuffer(_to_bytes(res[i]), dtype=np.float32) for i in range(len(res))]
@@ -133,10 +139,21 @@ def default_backend():
 
 
 # --------------------------------------------------------------------------- pipeline
+RANK_FILE = "unet/timestep_rank.txt"   # remembers which timestep rank the UNet accepted on this phone
+
+
+def _is_shape_error(e):
+    """True for errors that look like 'the graph does not agree with the shape we fed' (not out-of-memory etc.)."""
+    text = str(e)
+    return any(k in text for k in ("Gemm", "time_embedding", "Invalid rank", "NumDimensions", "Expand", "Unsqueeze"))
+
+
 class SDTurbo:
     def __init__(self, backend, models_dir):
         self.backend = backend
         self.dir = models_dir
+        self._rank = 1          # number of dimensions of the `timestep` tensor we feed
+        self._declared = None   # rank the unet graph declares for it (None = unknown)
 
     def _path(self, rel):
         return os.path.join(self.dir, *rel.split("/"))
@@ -162,7 +179,7 @@ class SDTurbo:
             dt = _DTYPES.get(dtypes[key])
             if dt is None:
                 raise RuntimeError("Unsupported input type %s for %s.%s" % (dtypes[key], model, key))
-            feeds[key] = np.ascontiguousarray(arr, dtype=dt)
+            feeds[key] = _c(arr, dt)
         return self.backend.run(model, feeds)
 
     # -- stage 1: text
@@ -192,19 +209,109 @@ class SDTurbo:
         rng = np.random.default_rng(seed)
         x = (rng.standard_normal((1, 4, lat, lat)) * init_sigma).astype(np.float32)
         set_progress(stage="Loading image model (first step is slow)", frac=0.14)
-        self.backend.load("unet", self._path("unet/model.onnx"), "none")
+        self._load_unet()
         try:
             for i, t in enumerate(ts):
                 check_cancel()
                 set_progress(stage="Generating: step %d of %d" % (i + 1, steps), frac=0.18 + 0.67 * i / steps)
                 sigma, sigma_next = float(sigmas[i]), float(sigmas[i + 1])
                 scaled = x / np.sqrt(sigma * sigma + 1.0)
-                eps = self._run("unet", ["sample", "timestep", "encoder_hidden_states"],
-                                [scaled, np.array([t]), hidden])[0].reshape(x.shape)
+                eps = self._unet_step(scaled, t, hidden, i == 0).reshape(x.shape)
                 x = (x + eps * (sigma_next - sigma)).astype(np.float32)
             return x
         finally:
-            self.backend.unload("unet")
+            try:
+                self.backend.unload("unet")
+            except Exception:   # nothing may be loaded after a failed recovery attempt
+                pass
+
+    # -- the unet's `timestep` input
+    def _ts(self, t, rank):
+        return np.array(float(t)).reshape((1,) * rank)   # rank 0 = scalar, 1 = [t], 2 = [[t]]
+
+    def _read_rank(self):
+        try:
+            with open(self._path(RANK_FILE), encoding="utf-8") as fh:
+                v = fh.read().strip()
+        except OSError:
+            return None
+        return int(v) if v in ("0", "1", "2") else None
+
+    def _write_rank(self, rank):
+        try:
+            with open(self._path(RANK_FILE), "w", encoding="utf-8") as fh:
+                fh.write(str(rank))
+        except OSError:
+            pass
+
+    def _patched(self, base, rank):
+        """Copy of the unet graph (same folder, so the weights still resolve) declaring `timestep` with `rank` dims."""
+        dst = self._path("unet/model_ts%d.onnx" % rank)
+        if not os.path.isfile(dst):
+            onnx_probe.patch_input_rank(base, dst, "timestep", rank)
+        return dst
+
+    def _load_unet(self):
+        base = self._path("unet/model.onnx")
+        try:
+            self._declared = onnx_probe.declared_rank(base, "timestep")
+        except Exception:
+            self._declared = None
+        remembered = self._read_rank()
+        self._rank = remembered if remembered is not None else (1 if self._declared is None else self._declared)
+        path = base
+        if self._declared is not None and self._rank != self._declared:
+            path = self._patched(base, self._rank)
+        self.backend.load("unet", path, "none")
+
+    def _unet_step(self, scaled, t, hidden, first):
+        names = ["sample", "timestep", "encoder_hidden_states"]
+        try:
+            return self._run("unet", names, [scaled, self._ts(t, self._rank), hidden])[0]
+        except Cancelled:
+            raise
+        except Exception as e:
+            if not first or not _is_shape_error(e):
+                raise
+            return self._unet_recover(scaled, t, hidden, e)
+
+    def _unet_recover(self, scaled, t, hidden, first_error):
+        """The graph rejected our timestep shape. Try the other ranks once (on patched copies of the small
+        graph file) and remember what works; if nothing does, fail with a message that says how the graph
+        declares and uses `timestep`, so the cause can be seen from the error text alone."""
+        base = self._path("unet/model.onnx")
+        try:
+            diag = onnx_probe.describe_path(base)
+        except Exception as ex:
+            diag = "graph probe failed: %s" % ex
+        tried, errors = [self._rank], []
+        for rank in (0, 2, 1):
+            if rank in tried:
+                continue
+            tried.append(rank)
+            check_cancel()
+            set_progress(stage="Adjusting the image model (one time)", frac=0.15)
+            try:
+                path = base if rank == self._declared else self._patched(base, rank)
+                try:
+                    self.backend.unload("unet")
+                except Exception:
+                    pass
+                self.backend.load("unet", path, "none")
+                eps = self._run("unet", ["sample", "timestep", "encoder_hidden_states"],
+                                [scaled, self._ts(t, rank), hidden])[0]
+            except Cancelled:
+                raise
+            except Exception as e2:
+                errors.append("rank %d: %s" % (rank, str(e2).replace("\n", " ")[:110]))
+                continue
+            self._rank = rank
+            self._write_rank(rank)
+            return eps
+        raise RuntimeError(
+            "The image model rejected its timestep input. First error: %s | other ranks tried: %s | %s"
+            % (str(first_error).replace("\n", " ")[:260], "; ".join(errors) or "none", diag[:700])
+        )
 
     # -- stage 3: decode
     def _vae(self, z):

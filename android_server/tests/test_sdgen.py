@@ -377,6 +377,189 @@ def test_motion():
     ok("motion: cancel closes the writer")
 
 
+# --------------------------------------------------------------------------- onnx_probe + timestep fallback
+def _varint_b(n):
+    out = b""
+    while True:
+        c = n & 0x7F
+        n >>= 7
+        if n:
+            out += bytes([c | 0x80])
+        else:
+            return out + bytes([c])
+
+
+def _fld(f, payload):
+    return _varint_b(f << 3 | 2) + _varint_b(len(payload)) + payload
+
+
+def _vfld(f, v):
+    return _varint_b(f << 3) + _varint_b(v)
+
+
+def _value_info(name, dims, elem=7):
+    shape = b"".join(_fld(1, _fld(2, d.encode()) if isinstance(d, str) else _vfld(1, d)) for d in dims)
+    tensor_type = _vfld(1, elem) + _fld(2, shape)
+    return _fld(1, name.encode()) + _fld(2, _fld(1, tensor_type))
+
+
+def _node(op, ins, outs, name, attrs=b""):
+    return b"".join(_fld(1, i.encode()) for i in ins) + b"".join(_fld(2, o.encode()) for o in outs) \
+        + _fld(3, name.encode()) + _fld(4, op.encode()) + attrs
+
+
+def _int64_init(name, vals):
+    raw = b"".join(int(v).to_bytes(8, "little", signed=True) for v in vals)
+    return _vfld(1, len(vals)) + _vfld(2, 7) + _fld(8, name.encode()) + _fld(9, raw)
+
+
+def synthetic_unet_graph(timestep_dims=("steps",)):
+    """A graph shaped like a real unet's time path: timestep -> Unsqueeze(axes=[0]) -> Expand -> ... -> Gemm."""
+    nodes = [
+        _node("Unsqueeze", ["timestep", "axes0"], ["t1"], "/up_blocks.0/Unsqueeze"),
+        _node("Expand", ["t1", "bs"], ["t2"], "/Expand"),
+        _node("Cast", ["t2"], ["t3"], "/time_proj/Cast"),
+        _node("Gemm", ["t3", "w"], ["t4"], "/time_embedding/linear_1/Gemm"),
+    ]
+    graph = b"".join(_fld(1, n) for n in nodes)
+    graph += _fld(5, _int64_init("axes0", [0])) + _fld(5, _int64_init("bs", [1]))
+    graph += _fld(11, _value_info("sample", ["batch", 4, "h", "w"], 1))
+    graph += _fld(11, _value_info("timestep", list(timestep_dims)))
+    graph += _fld(12, _value_info("out_sample", ["batch", 4, "h", "w"], 1))
+    return _vfld(1, 8) + _fld(2, b"test") + _fld(7, graph + _fld(2, b"g"))
+
+
+def test_onnx_probe():
+    from sdgen import onnx_probe as O
+    src = os.path.join(TMP, "probe_src.onnx")
+    open(src, "wb").write(synthetic_unet_graph())
+    g = O.read(src)
+    assert [i["name"] for i in g["inputs"]] == ["sample", "timestep"]
+    assert g["inputs"][1]["dims"] == ["steps"] and g["inputs"][0]["dims"] == ["batch", 4, "h", "w"]
+    assert [n["op"] for n in g["nodes"]] == ["Unsqueeze", "Expand", "Cast", "Gemm"] and g["inits"]["axes0"] == [0]
+    assert O.declared_rank(src, "timestep") == 1 and O.declared_rank(src, "nope") is None
+    d = O.describe_path(src)
+    assert "timestep[steps]" in d and "Unsqueeze([0])" in d and d.endswith("Gemm"), d
+    for rank, dims in ((0, []), (2, ["d0", "d1"]), (1, ["d0"])):
+        dst = os.path.join(TMP, "probe_%d.onnx" % rank)
+        O.patch_input_rank(src, dst, "timestep", rank)
+        h = O.read(dst)
+        assert h["inputs"][1]["dims"] == dims and h["inputs"][1]["elem"] == 7, (rank, h["inputs"][1])
+        assert h["inputs"][0]["dims"] == ["batch", 4, "h", "w"] and [n["op"] for n in h["nodes"]] == [n["op"] for n in g["nodes"]]
+        assert h["inits"] == g["inits"] and len(h["inputs"]) == 2
+    try:
+        O.patch_input_rank(src, os.path.join(TMP, "x.onnx"), "nope", 0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("patching a missing input must fail")
+    open(os.path.join(TMP, "junk.onnx"), "wb").write(b"x")
+    try:
+        O.read(os.path.join(TMP, "junk.onnx"))
+    except Exception:
+        pass
+    else:
+        raise AssertionError("junk must not parse")
+    ok("onnx_probe: reads inputs/ops/constants, patches the declared rank, rejects junk")
+
+
+class RankBackend(FakeBackend):
+    """Behaves like a graph that treats `timestep` as a scalar although it declares a vector: it only works once
+    the declared rank was patched to 0 and a scalar is fed (anything else fails like the phone did)."""
+
+    GEMM = ("ai.onnxruntime.OrtException: Non-zero status code returned while running Gemm node. "
+            "Name:'/time_embedding/linear_1/Gemm' Status Message: left.NumDimensions() == 2 || left.NumDimensions() == 1 was false.")
+
+    def __init__(self, works_at=0, error=None):
+        super().__init__()
+        self.paths, self.works_at, self.error = [], works_at, error
+        self.attempts = []
+
+    def load(self, name, path, opt):
+        super().load(name, path, opt)
+        self.paths.append(os.path.basename(os.path.dirname(path)) + "/" + os.path.basename(path))
+        self.cur = path
+
+    def run(self, name, feeds):
+        if name != "unet":
+            return super().run(name, feeds)
+        from sdgen import onnx_probe as O
+        declared = O.declared_rank(self.cur, "timestep")
+        ts = feeds["timestep"]
+        self.attempts.append((os.path.basename(self.cur), ts.ndim))
+        if self.error:
+            raise RuntimeError(self.error)
+        if ts.ndim != declared:
+            raise RuntimeError("Invalid rank for input: timestep Got: %d Expected: %d" % (ts.ndim, declared))
+        if ts.ndim != self.works_at:
+            raise RuntimeError(self.GEMM)
+        return super().run(name, feeds)
+
+
+def test_unet_timestep_fallback(real_tok_dir):
+    md = make_models_dir()
+    tiny_tokenizer_files(md) if not real_tok_dir else make_tokenizer_files(md, real_tok_dir)
+    unet = os.path.join(md, "unet", "model.onnx")
+    open(unet, "wb").write(synthetic_unet_graph())
+
+    # 1) graph acts on timestep as a scalar: first try (rank 1) fails like on the phone, rank 0 works
+    be = RankBackend(works_at=0)
+    out = os.path.join(TMP, "fb1.jpg")
+    assert P.generate_image("fox", 1, 384, 3, md, out, True, be) == out and cv2.imread(out).shape == (384, 384, 3)
+    assert be.paths.count("unet/model.onnx") == 1 and "unet/model_ts0.onnx" in be.paths and not be.loaded, be.paths
+    assert be.attempts[0] == ("model.onnx", 1) and be.attempts[-1] == ("model_ts0.onnx", 0), be.attempts
+    assert open(os.path.join(md, "unet", "timestep_rank.txt")).read() == "0"
+    ok("unet timestep: rank mismatch is detected, patched graph used, result produced")
+
+    # 2) the next image goes straight to the patched graph (no failing attempt, no second reload)
+    be2 = RankBackend(works_at=0)
+    P.generate_image("fox", 2, 384, 3, md, os.path.join(TMP, "fb2.jpg"), True, be2)
+    assert be2.paths.count("unet/model.onnx") == 0 and be2.attempts[0] == ("model_ts0.onnx", 0), be2.attempts
+    assert len(be2.attempts) == 2 and be2.paths.count("unet/model_ts0.onnx") == 1
+    ok("unet timestep: remembered for the next image (2 steps, one load)")
+
+    # 3) nothing works: the error explains how the graph declares/uses timestep
+    md3 = make_models_dir()
+    tiny_tokenizer_files(md3)
+    open(os.path.join(md3, "unet", "model.onnx"), "wb").write(synthetic_unet_graph())
+    be3 = RankBackend(works_at=99)
+    try:
+        P.generate_image("fox", 1, 384, 3, md3, os.path.join(TMP, "fb3.jpg"), True, be3)
+    except RuntimeError as e:
+        msg = str(e)
+        assert "timestep input" in msg and "Gemm" in msg and "timestep[steps]" in msg and "Unsqueeze([0])" in msg, msg
+        assert "rank 0" in msg and "rank 2" in msg, msg
+    else:
+        raise AssertionError("must fail")
+    assert not be3.loaded
+    st = json.loads(P.get_progress())
+    assert st["done"] and "timestep input" in st["error"]
+    ok("unet timestep: if no rank works the error text carries the graph diagnostics")
+
+    # 4) other errors (e.g. out of memory) are not mistaken for a shape problem: no reload attempts
+    md4 = make_models_dir()
+    tiny_tokenizer_files(md4)
+    open(os.path.join(md4, "unet", "model.onnx"), "wb").write(synthetic_unet_graph())
+    be4 = RankBackend(error="java.lang.OutOfMemoryError: Failed to allocate 3463659136 bytes")
+    try:
+        P.generate_image("fox", 1, 384, 3, md4, os.path.join(TMP, "fb4.jpg"), True, be4)
+    except RuntimeError as e:
+        assert "OutOfMemory" in str(e) and "timestep input" not in str(e)
+    else:
+        raise AssertionError("must fail")
+    assert be4.paths.count("unet/model.onnx") == 1 and len(be4.paths) == 2 and len(be4.attempts) == 1, be4.paths  # te + unet once
+    ok("unet timestep: out-of-memory style errors are passed through untouched")
+
+    # 5) a graph that already declares what it uses needs no patching
+    md5 = make_models_dir()
+    tiny_tokenizer_files(md5)
+    open(os.path.join(md5, "unet", "model.onnx"), "wb").write(synthetic_unet_graph(timestep_dims=()))
+    be5 = RankBackend(works_at=0)
+    P.generate_image("fox", 1, 384, 3, md5, os.path.join(TMP, "fb5.jpg"), True, be5)
+    assert be5.attempts == [("model.onnx", 0)] and not os.path.exists(os.path.join(md5, "unet", "model_ts0.onnx"))
+    ok("unet timestep: a scalar-declared graph is fed a scalar from the start")
+
+
 if __name__ == "__main__":
     clip_dir = sys.argv[1] if len(sys.argv) > 1 else None
     real = None
@@ -387,5 +570,7 @@ if __name__ == "__main__":
         print("skip - tokenizer reference test (pass the openai/CLIP clip directory)")
     test_scheduler()
     test_pipeline(real)
+    test_onnx_probe()
+    test_unet_timestep_fallback(real)
     test_motion()
     print("SDGEN ALL OK")

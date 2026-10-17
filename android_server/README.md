@@ -34,6 +34,7 @@ client app ──HTTP──> server.py (Python 3.10 via Chaquopy, in this app)
    `POST /jobs/<id>/cancel`, then the usual `GET /jobs/<id>` and `GET /jobs/<id>/result` (JPEG or MP4).
 - Memory: models are loaded one at a time (text encoder, then UNet, then decoder) and the face models are unloaded first, so a 6 GB phone can run it. Close other apps first; if Android still kills the app, choose 384 px and keep "Low-memory decoding" on.
 - Speed on a phone CPU: roughly one to several minutes per image (not measured on a device).
+- If the image model rejects its `timestep` input (error mentioning `/time_embedding/linear_1/Gemm`), the app retries once with a patched copy of the small graph file (`unet/model_ts0.onnx` or `model_ts2.onnx`), remembers what worked in `unet/timestep_rank.txt`, and carries on. If nothing works, the error text lists how the graph declares and uses `timestep`; send that text to whoever maintains the app.
 - Licence: SD-Turbo is under the Stability AI Community License (free for research and for commercial use below US$1M annual revenue; its Acceptable Use Policy applies to derivatives). Selling anything built on it needs a lawyer's check.
 
 ## Requirements and limits
