@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -21,8 +22,14 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -39,27 +46,19 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+/** Server URL + token (shared by both tabs), then a tab for face swap and a tab for text to image / video. */
 @Composable
 fun Screen(vm: SwapViewModel = viewModel()) {
-    val pickFace = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) {
-        if (it != null) vm.sourceFace = it
-    }
-    val pickImages = rememberLauncherForActivityResult(
-        ActivityResultContracts.PickMultipleVisualMedia(MAX_IMAGES)
-    ) { vm.setImages(it) }
-    val pickVideo = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) {
-        if (it != null) vm.targetVideo = it
-    }
+    var tab by remember { mutableIntStateOf(0) }
 
     Column(
         Modifier
             .fillMaxSize()
+            .statusBarsPadding()
             .verticalScroll(rememberScrollState())
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        Text("Face Swap (Colab server)", style = MaterialTheme.typography.headlineSmall)
-
         OutlinedTextField(
             vm.serverUrl, { vm.serverUrl = it },
             label = { Text("Server URL (Colab https://… or phone http://127.0.0.1:8000)") },
@@ -70,6 +69,30 @@ fun Screen(vm: SwapViewModel = viewModel()) {
             label = { Text("Token") },
             singleLine = true, modifier = Modifier.fillMaxWidth(),
         )
+
+        TabRow(selectedTabIndex = tab) {
+            Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("Face swap") })
+            Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Text to image") })
+        }
+
+        if (tab == 0) SwapContent(vm) else CreateScreen(vm.serverUrl, vm.token)
+    }
+}
+
+@Composable
+private fun SwapContent(vm: SwapViewModel) {
+    val pickFace = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) {
+        if (it != null) vm.sourceFace = it
+    }
+    val pickImages = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(MAX_IMAGES)
+    ) { vm.setImages(it) }
+    val pickVideo = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) {
+        if (it != null) vm.targetVideo = it
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text("Face Swap", style = MaterialTheme.typography.headlineSmall)
 
         Text("1. Face to use", style = MaterialTheme.typography.titleMedium)
         OutlinedButton(onClick = {

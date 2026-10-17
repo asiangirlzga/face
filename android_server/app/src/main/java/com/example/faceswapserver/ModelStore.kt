@@ -67,13 +67,18 @@ object ModelStore {
         }
     }
 
-    private fun downloadWithRetry(url: String, dest: File, onProgress: (Long, Long) -> Unit) {
+    /** Set to true to make a running download stop (it can be resumed later). */
+    @Volatile
+    var abort = false
+
+    fun downloadWithRetry(url: String, dest: File, onProgress: (Long, Long) -> Unit) {
         var last: Exception? = null
         repeat(5) {
             try {
                 download(url, dest, onProgress)
                 return
             } catch (e: IOException) {
+                if (abort) throw e
                 last = e
                 Thread.sleep(2000)
             }
@@ -105,6 +110,7 @@ object ModelStore {
                     val buf = ByteArray(256 * 1024)
                     var lastReport = 0L
                     while (true) {
+                        if (abort) throw IOException("Download cancelled")
                         val n = input.read(buf)
                         if (n < 0) break
                         out.write(buf, 0, n)

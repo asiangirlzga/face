@@ -1,11 +1,16 @@
-"""HTTP face-swap server that runs on the phone (Chaquopy) or on any desktop for testing.
+"""HTTP face-swap / text-to-image server that runs on the phone (Chaquopy) or on any desktop for testing.
 
-Same API as the Colab server (header  X-Token: <token>):
-  GET  /health                                   -> {"ok":true,"engine":"ready|loading|missing|error", ...}  (no token)
+Same face-swap API as the Colab server (header  X-Token: <token>):
+  GET  /health                                   -> {"ok":true,"engine":"ready|idle|loading|missing|error","t2i":"ready|missing"}  (no token)
   POST /jobs/images   form: source, targets x1..50  -> {"job_id"}
   POST /jobs/video    form: source, video           -> {"job_id"}
-  GET  /jobs/<id>                                   -> status JSON
-  GET  /jobs/<id>/result                            -> zip of JPEGs (images) or mp4 (video)
+  GET  /jobs/<id>                                   -> status JSON (status: queued|running|done|error|cancelled, stage, seed)
+  GET  /jobs/<id>/result                            -> zip of JPEGs (images), jpeg (text2img) or mp4 (video, img2video)
+  POST /jobs/<id>/cancel                            -> {"ok":true}
+
+Offline image generation (needs the SD-Turbo model files downloaded in the app):
+  POST /jobs/text2img  JSON {prompt, steps 1-8, size 256-768 (x64), seed?, tiled?}  -> {"job_id"}
+  POST /jobs/img2video form: image, style, seconds 1-10, fps 12-30                  -> {"job_id"}  (camera zoom/pan clip)
 """
 import io
 import json
@@ -25,21 +30,31 @@ import cv2
 import numpy as np
 
 import engine as E
+from sdgen import motion as sdm
+from sdgen import pipeline as sdp
 
 MAX_IMAGES = 50
 MAX_IMAGE_SIDE = 4096     # downscale anything bigger (memory)
 MAX_VIDEO_SIDE = 1280     # video frames are downscaled to this (speed on a phone)
 JOB_TTL = 6 * 3600
+FINISHED = ("done", "error", "cancelled")
 
-_cfg = {"token": "", "models": "", "work": "", "host": "127.0.0.1", "port": 8000}
+_cfg = {"token": "", "models": "", "work": "", "sd": "", "host": "127.0.0.1", "port": 8000}
 _jobs = {}
 _jobs_lock = threading.Lock()
 _queue = queue.Queue()
 _engine = {"obj": None, "status": "loading", "error": None}
+_engine_lock = threading.Lock()
 _httpd = None
 # Test hooks: override to run off-device.
 backend_factory = lambda: E.AndroidOrt()
 video_factory = None  # () -> object with open/read/open_writer/write/close_writer
+sd_backend_factory = None  # () -> ONNX backend for sdgen.pipeline (default: Android OrtBridge)
+sd_writer_factory = None   # () -> frame writer for sdgen.motion (default: Android VideoBridge)
+
+
+class _JobCancelled(Exception):
+    pass
 
 
 # --------------------------------------------------------------------------- multipart
@@ -138,12 +153,30 @@ def _load_engine():
         _engine["status"], _engine["error"] = "error", str(e)
 
 
+def _wait_engine_settled():
+    for _ in range(600):   # a load that is still in progress finishes first
+        if _engine["status"] != "loading":
+            break
+        time.sleep(0.5)
+
+
+def _free_face_engine():
+    """Unload the face models (about 0.8 GB) before the image model needs the RAM; reloaded on demand."""
+    _wait_engine_settled()
+    with _engine_lock:
+        eng = _engine["obj"]
+        if eng is not None:
+            eng.unload()
+            _engine.update(obj=None, status="idle", error=None)
+
+
 def _engine_or_fail():
-    if _engine["status"] == "loading":
-        for _ in range(600):
-            if _engine["status"] != "loading":
-                break
-            time.sleep(0.5)
+    _wait_engine_settled()
+    if _engine["status"] == "idle":
+        with _engine_lock:
+            if _engine["status"] == "idle":
+                _engine["status"] = "loading"
+                _load_engine()
     if _engine["status"] != "ready":
         raise RuntimeError(_engine["error"] or "Face swap models are not ready")
     return _engine["obj"]
@@ -153,7 +186,7 @@ def _cleanup_old():
     now = time.time()
     with _jobs_lock:
         for jid, j in list(_jobs.items()):
-            if now - j["created"] > JOB_TTL and j["status"] in ("done", "error"):
+            if now - j["created"] > JOB_TTL and j["status"] in FINISHED:
                 shutil.rmtree(j["dir"], ignore_errors=True)
                 del _jobs[jid]
 
@@ -164,7 +197,8 @@ def _new_job(kind, total):
     d = os.path.join(_cfg["work"], jid)
     os.makedirs(d)
     job = {"status": "queued", "done": 0, "total": total, "error": None, "kind": kind,
-           "skipped": [], "dir": d, "result": None, "created": time.time()}
+           "skipped": [], "dir": d, "result": None, "created": time.time(),
+           "stage": "", "seed": None, "cancel": False}
     with _jobs_lock:
         _jobs[jid] = job
     return jid, job, d
@@ -193,6 +227,8 @@ def _run_images(job, src_path, targets):
         zpath = os.path.join(job["dir"], "result.zip")
         with zipfile.ZipFile(zpath, "w", zipfile.ZIP_STORED) as z:
             for i, (orig, path) in enumerate(targets):
+                if job["cancel"]:
+                    raise _JobCancelled()
                 try:
                     img = read_image(path)
                     if img is None:
@@ -212,6 +248,8 @@ def _run_images(job, src_path, targets):
                     os.remove(path)
                     job["done"] += 1
         job["result"], job["status"] = zpath, "done"
+    except _JobCancelled:
+        job["status"] = "cancelled"
     except Exception as e:
         traceback.print_exc()
         job["status"], job["error"] = "error", str(e)
@@ -275,6 +313,8 @@ def _run_video(job, src_path, video_path):
         out_path = os.path.join(job["dir"], "result.mp4")
         writer_open, last, size = False, None, None
         for i in range(frames):
+            if job["cancel"]:
+                raise _JobCancelled()
             frame = vb.read(i)
             if frame is None:
                 frame = last  # tail frames the decoder cannot seek to
@@ -299,6 +339,13 @@ def _run_video(job, src_path, video_path):
             raise RuntimeError("No frames could be decoded")
         vb.close_writer(video_path)
         job["result"], job["status"] = out_path, "done"
+    except _JobCancelled:
+        job["status"] = "cancelled"
+        try:   # finish the half-written file so the encoder is released
+            if writer_open:
+                vb.close_writer(video_path)
+        except Exception:
+            pass
     except Exception as e:
         traceback.print_exc()
         job["status"], job["error"] = "error", str(e)
@@ -315,10 +362,135 @@ def _run_video(job, src_path, video_path):
                 pass
 
 
+# --------------------------------------------------------------------------- text-to-image / image-to-video
+NO_IMAGE_MODEL = ("The image model is not on the phone yet. Open the Face Swap Server app, go to the "
+                  "Text to image tab and tap Download image model.")
+
+
+def _sd_ready():
+    return bool(_cfg["sd"]) and not sdp.missing_files(_cfg["sd"])
+
+
+def _t2i_params(b):
+    """Validate the JSON body of POST /jobs/text2img (ValueError -> HTTP 400)."""
+    if not isinstance(b, dict):
+        raise ValueError("expected a JSON object")
+    prompt = str(b.get("prompt") or "").strip()
+    if not prompt:
+        raise ValueError("Please type a prompt")
+    if len(prompt) > 1000:
+        raise ValueError("The prompt is too long (max 1000 characters)")
+    try:
+        steps = int(b.get("steps", 1))
+        size = int(b.get("size", 512))
+        seed = b.get("seed")
+        seed = None if seed in (None, "") else int(seed)
+    except (TypeError, ValueError):
+        raise ValueError("steps, size and seed must be numbers")
+    if not 1 <= steps <= 8:
+        raise ValueError("Steps must be between 1 and 8")
+    if size % 64 or not 256 <= size <= 768:
+        raise ValueError("Image size must be a multiple of 64 between 256 and 768")
+    if seed is not None and seed < 0:
+        seed = None
+    return {"prompt": prompt, "steps": steps, "size": size, "seed": seed, "tiled": bool(b.get("tiled", True))}
+
+
+def _i2v_params(fields):
+    """Validate the form fields of POST /jobs/img2video (ValueError -> HTTP 400)."""
+    style = (fields.get("style") or "zoom_in").strip()
+    if style not in sdm.STYLES:
+        raise ValueError("Unknown style: %s (use one of %s)" % (style, ", ".join(sdm.STYLES)))
+    try:
+        seconds = int(fields.get("seconds") or 4)
+        fps = int(fields.get("fps") or 24)
+    except ValueError:
+        raise ValueError("seconds and fps must be numbers")
+    if not 1 <= seconds <= 10 or not 12 <= fps <= 30:
+        raise ValueError("Use 1-10 seconds and 12-30 fps")
+    return {"style": style, "seconds": seconds, "fps": fps}
+
+
+def _sync_progress(job):
+    """Copy the live sdgen progress (stage text, fraction, seed) into the job record."""
+    try:
+        st = json.loads(sdp.get_progress())
+    except ValueError:
+        return
+    job["stage"] = st.get("stage") or ""
+    job["done"] = int(float(st.get("frac") or 0.0) * 1000)
+    job["total"] = 1000
+    if st.get("seed") is not None:
+        job["seed"] = st["seed"]
+
+
+def _watch_progress(job, stop):
+    while not stop.wait(0.5):
+        _sync_progress(job)
+
+
+def _run_text2img(job, params):
+    stop = threading.Event()
+    try:
+        if job["cancel"]:
+            raise _JobCancelled()
+        job["status"] = "running"
+        job["stage"] = "Freeing memory"
+        _free_face_engine()
+        out = os.path.join(job["dir"], "result.jpg")
+        backend = sd_backend_factory() if sd_backend_factory else None
+        threading.Thread(target=_watch_progress, args=(job, stop), daemon=True).start()
+        res = sdp.generate_image(params["prompt"], params["steps"], params["size"], params["seed"],
+                                 _cfg["sd"], out, params["tiled"], backend)
+        stop.set()
+        _sync_progress(job)
+        if not res:
+            raise _JobCancelled()
+        job["result"], job["status"] = out, "done"
+    except _JobCancelled:
+        job["status"] = "cancelled"
+    except Exception as e:
+        traceback.print_exc()
+        job["status"], job["error"] = "error", str(e)
+    finally:
+        stop.set()
+
+
+def _run_img2video(job, image_path, params):
+    stop = threading.Event()
+    try:
+        if job["cancel"]:
+            raise _JobCancelled()
+        job["status"] = "running"
+        out = os.path.join(job["dir"], "result.mp4")
+        writer = sd_writer_factory() if sd_writer_factory else None
+        threading.Thread(target=_watch_progress, args=(job, stop), daemon=True).start()
+        res = sdm.make_video(image_path, out, params["seconds"], params["fps"], params["style"], 768, writer)
+        stop.set()
+        _sync_progress(job)
+        if not res:
+            raise _JobCancelled()
+        job["result"], job["status"] = out, "done"
+    except _JobCancelled:
+        job["status"] = "cancelled"
+    except Exception as e:
+        traceback.print_exc()
+        job["status"], job["error"] = "error", str(e)
+    finally:
+        stop.set()
+        try:
+            os.remove(image_path)
+        except OSError:
+            pass
+
+
 def _worker():
     while True:
         fn, args = _queue.get()
-        fn(*args)
+        try:
+            fn(*args)
+        except Exception:   # a runner bug must not kill the only worker thread
+            traceback.print_exc()
 
 
 # --------------------------------------------------------------------------- HTTP
@@ -347,7 +519,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             path = self.path.split("?")[0].rstrip("/")
             if path == "/health":
-                return self._json(200, {"ok": True, "engine": _engine["status"], "error": _engine["error"]})
+                return self._json(200, {"ok": True, "engine": _engine["status"], "error": _engine["error"],
+                                        "t2i": "ready" if _sd_ready() else "missing"})
             if not self._auth():
                 return
             m = re.fullmatch(r"/jobs/([0-9a-f]+)(/result)?", path)
@@ -355,12 +528,13 @@ class Handler(BaseHTTPRequestHandler):
             if not job:
                 return self._json(404, {"detail": "unknown job"})
             if not m.group(2):
-                return self._json(200, {k: job[k] for k in ("status", "done", "total", "error", "kind", "skipped")})
+                return self._json(200, {k: job[k] for k in (
+                    "status", "done", "total", "error", "kind", "skipped", "stage", "seed")})
             if job["status"] != "done":
                 return self._json(404, {"detail": "result not ready"})
             size = os.path.getsize(job["result"])
             self.send_response(200)
-            self.send_header("Content-Type", "application/zip" if job["kind"] == "images" else "video/mp4")
+            self.send_header("Content-Type", {"images": "application/zip", "text2img": "image/jpeg"}.get(job["kind"], "video/mp4"))
             self.send_header("Content-Length", str(size))
             self.end_headers()
             with open(job["result"], "rb") as fh:
@@ -376,18 +550,51 @@ class Handler(BaseHTTPRequestHandler):
             if not self._auth():
                 return
             path = self.path.split("?")[0].rstrip("/")
-            if path not in ("/jobs/images", "/jobs/video"):
+            cancel = re.fullmatch(r"/jobs/([0-9a-f]+)/cancel", path)
+            if cancel:
+                job = _jobs.get(cancel.group(1))
+                if not job:
+                    return self._json(404, {"detail": "unknown job"})
+                job["cancel"] = True
+                if job["status"] == "running" and job["kind"] in ("text2img", "img2video"):
+                    sdp.cancel()   # stops after the current step / frame
+                return self._json(200, {"ok": True})
+            if path == "/jobs/text2img":
+                length = int(self.headers.get("Content-Length") or 0)
+                if length > 100_000:
+                    return self._json(413, {"detail": "request too large"})
+                try:
+                    params = _t2i_params(json.loads(self.rfile.read(length).decode("utf-8") or "{}"))
+                except ValueError as e:   # includes bad JSON
+                    return self._json(400, {"detail": str(e)})
+                if not _sd_ready():
+                    return self._json(409, {"detail": NO_IMAGE_MODEL})
+                jid, job, _ = _new_job("text2img", 1000)
+                _queue.put((_run_text2img, (job, params)))
+                return self._json(200, {"job_id": jid})
+            if path not in ("/jobs/images", "/jobs/video", "/jobs/img2video"):
                 return self._json(404, {"detail": "not found"})
             length = int(self.headers.get("Content-Length") or 0)
-            kind = "images" if path.endswith("images") else "video"
+            kind = {"/jobs/images": "images", "/jobs/video": "video", "/jobs/img2video": "img2video"}[path]
             jid, job, d = _new_job(kind, 1)
             try:
-                files, _ = parse_multipart(self.rfile, self.headers.get("Content-Type"), length, d)
+                files, fields = parse_multipart(self.rfile, self.headers.get("Content-Type"), length, d)
             except Exception as e:
                 shutil.rmtree(d, ignore_errors=True)
                 with _jobs_lock:
                     _jobs.pop(jid, None)
                 return self._json(400, {"detail": str(e)})
+            if kind == "img2video":
+                img = [f for f in files if f[0] == "image"]
+                if not img:
+                    return self._fail(jid, d, "missing 'image' file")
+                try:
+                    params = _i2v_params(fields)
+                except ValueError as e:
+                    return self._fail(jid, d, str(e))
+                job["total"] = 1000
+                _queue.put((_run_img2video, (job, img[0][2], params)))
+                return self._json(200, {"job_id": jid})
             src = [f for f in files if f[0] == "source"]
             if not src:
                 return self._fail(jid, d, "missing 'source' file")
@@ -417,10 +624,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # --------------------------------------------------------------------------- entry points (called from Kotlin)
-def serve(host, port, token, models_dir, work_dir):
-    """Blocks until stop() is called."""
+def serve(host, port, token, models_dir, work_dir, sd_dir=""):
+    """Blocks until stop() is called. sd_dir holds the SD-Turbo files for text-to-image (optional)."""
     global _httpd
-    _cfg.update(host=host, port=int(port), token=token, models=models_dir, work=work_dir)
+    _cfg.update(host=host, port=int(port), token=token, models=models_dir, work=work_dir, sd=sd_dir or "")
     shutil.rmtree(work_dir, ignore_errors=True)
     os.makedirs(work_dir, exist_ok=True)
     _jobs.clear()
@@ -450,6 +657,7 @@ def get_state():
         last = max(_jobs.values(), key=lambda j: j["created"]) if _jobs else None
     return json.dumps({
         "engine": _engine["status"], "engine_error": _engine["error"],
+        "t2i": "ready" if _sd_ready() else "missing",
         "active": len(active),
-        "last": None if not last else {k: last[k] for k in ("kind", "status", "done", "total", "error")},
+        "last": None if not last else {k: last[k] for k in ("kind", "status", "done", "total", "error", "stage")},
     })

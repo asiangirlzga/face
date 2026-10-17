@@ -41,6 +41,9 @@ class AndroidOrt:
     def load(self, name, path):
         self._b.load(name, path)
 
+    def unload(self, name):
+        self._b.unload(name)
+
     def run(self, name, arrays):
         from java import jarray
         arrays = [np.ascontiguousarray(a, dtype=np.float32) for a in arrays]
@@ -321,9 +324,18 @@ class Swapper:
 # --------------------------------------------------------------------------- facade
 class Engine:
     def __init__(self, backend, models_dir):
+        self.backend = backend
         self.detector = Detector(backend, os.path.join(models_dir, DET_FILE))
         self.recognizer = Recognizer(backend, os.path.join(models_dir, REC_FILE))
         self.swapper = Swapper(backend, os.path.join(models_dir, SWAP_FILE))
+
+    def unload(self):
+        """Release the ONNX sessions (RAM) so a bigger model can use the memory."""
+        for name in ("det", "rec", "swap"):
+            try:
+                self.backend.unload(name)
+            except Exception:
+                pass
 
     def source_latent(self, img):
         faces = self.detector.detect(img)

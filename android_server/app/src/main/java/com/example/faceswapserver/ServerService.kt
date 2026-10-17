@@ -47,7 +47,10 @@ class ServerService : Service() {
                 ServerState.running = true
                 startPolling(server)
                 val work = File(cacheDir, "jobs").absolutePath
-                server.callAttr("serve", host, port, token, ModelStore.dir(this).absolutePath, work)  // blocks
+                server.callAttr(
+                    "serve", host, port, token, ModelStore.dir(this).absolutePath, work,
+                    SdModelStore.dir(this).absolutePath,   // image model folder for POST /jobs/text2img
+                )  // blocks
             } catch (t: Throwable) {
                 ServerState.error = t.message ?: t.toString()
             } finally {

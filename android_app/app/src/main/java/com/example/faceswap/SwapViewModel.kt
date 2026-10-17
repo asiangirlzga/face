@@ -75,6 +75,7 @@ class SwapViewModel(app: Application) : AndroidViewModel(app) {
                         progress = if (st.total > 0) st.done.toFloat() / st.total else 0f
                         message = "Processing on server: ${st.done}/${st.total}"
                         if (st.status == "error") error(st.error ?: "Server error")
+                        if (st.status == "cancelled") error("The job was cancelled on the server")
                         if (st.status == "done") {
                             message = "Downloading result…"
                             val tmp = File(ctx.cacheDir, if (kind == "images") "result.zip" else "result.mp4")
