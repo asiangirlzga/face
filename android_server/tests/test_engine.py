@@ -73,6 +73,7 @@ def main(models):
             blob = arrays[0]; out = np.clip(blob * 0.5 + 0.4, 0, 1)  # visibly different face region
             return [out.astype(np.float32).reshape(-1)]
     sw = E.Swapper.__new__(E.Swapper); sw.backend = FakeBE(); sw.emap = np.eye(512, dtype=np.float32)
+    sw.color_match, sw.sharpen, sw.grain = True, 0.7, True
     lat = sw.latent(e1); assert lat.shape == (1, 512)
     out = sw.swap(img, f.kps, lat)
     diff = np.abs(out.astype(int) - img.astype(int)).sum(2)
@@ -80,6 +81,28 @@ def main(models):
     inside = diff[y1:y2, x1:x2].mean(); outside = diff[:max(y1 - 80, 1), :].mean()
     print("diff inside face", round(inside, 1), "far outside", round(outside, 2))
     assert inside > 5 and outside < 0.5 and out.shape == img.shape and out.dtype == np.uint8
+    # skin tone: a stand-in face with a very different tone must end up close to the photo's own skin
+    class TintBE(FakeBE):
+        def run(self, name, arrays):
+            out = np.clip(arrays[0] * 0.4 + np.array([0.45, 0.1, 0.1], np.float32).reshape(1, 3, 1, 1), 0, 1)
+            return [out.astype(np.float32).reshape(-1)]
+    def core_mean(im):
+        cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2); r = max(int((x2 - x1) / 8), 3)
+        return im[cy - r:cy + r, cx - r:cx + r].reshape(-1, 3).mean(0)
+    sw.backend = TintBE()
+    sw.color_match = False; raw = core_mean(sw.swap(img, f.kps, lat))
+    sw.color_match = True; matched = core_mean(sw.swap(img, f.kps, lat))
+    base = core_mean(img)
+    print("skin tone error  raw", round(float(np.abs(raw - base).mean()), 1), " matched", round(float(np.abs(matched - base).mean()), 1))
+    assert np.abs(matched - base).mean() < np.abs(raw - base).mean() * 0.6
+    # sharpening: matched output is at least as crisp as the unsharpened one (Laplacian variance inside the face)
+    sw.backend = FakeBE()
+    sw.sharpen = 0.0; soft = sw.swap(img, f.kps, lat)
+    sw.sharpen = 0.7; crisp = sw.swap(img, f.kps, lat)
+    lv = lambda im: cv2.Laplacian(cv2.cvtColor(im[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY), cv2.CV_64F).var()
+    print("laplacian var soft", round(lv(soft), 1), "crisp", round(lv(crisp), 1))
+    assert lv(crisp) >= lv(soft)
+    assert np.array_equal(sw.swap(img, f.kps, lat), crisp)    # deterministic
     # blank image: no faces
     assert det.detect(np.full((480, 640, 3), 127, np.uint8)) == []
     print("ALL OK")

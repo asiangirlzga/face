@@ -278,7 +278,8 @@ def load_emap(onnx_path):
 class Swapper:
     SIZE = 128
 
-    def __init__(self, backend, path):
+    def __init__(self, backend, path, color_match=True, sharpen=0.7, grain=True):
+        self.color_match, self.sharpen, self.grain = color_match, sharpen, grain
         self.backend = backend
         backend.load("swap", path)
         self.emap = load_emap(path)
@@ -296,14 +297,10 @@ class Swapper:
         bgr_fake = np.clip(255 * fake, 0, 255).astype(np.uint8)[:, :, ::-1]
 
         H, W = img.shape[:2]
-        fake_diff = np.abs(bgr_fake.astype(np.float32) - aimg.astype(np.float32)).mean(axis=2)
-        fake_diff[:2, :] = 0
-        fake_diff[-2:, :] = 0
-        fake_diff[:, :2] = 0
-        fake_diff[:, -2:] = 0
         IM = cv2.invertAffineTransform(M)
         white = np.full((self.SIZE, self.SIZE), 255, dtype=np.float32)
-        bgr_fake = cv2.warpAffine(bgr_fake, IM, (W, H), borderValue=0.0)
+        # cubic resampling keeps the 128px face much sharper than the default bilinear upscale
+        bgr_fake = cv2.warpAffine(bgr_fake, IM, (W, H), flags=cv2.INTER_CUBIC, borderValue=0.0)
         white = cv2.warpAffine(white, IM, (W, H), borderValue=0.0)
         white[white > 20] = 255
         mask = white
@@ -313,12 +310,58 @@ class Swapper:
         mask_h, mask_w = hs.max() - hs.min(), ws.max() - ws.min()
         mask_size = int(np.sqrt(mask_h * mask_w))
         k = max(mask_size // 10, 10)
-        mask = cv2.erode(mask, np.ones((k, k), np.uint8), iterations=1)
+        inner = cv2.erode(mask, np.ones((k, k), np.uint8), iterations=1)
         k = max(mask_size // 20, 5)
-        mask = cv2.GaussianBlur(mask, (2 * k + 1, 2 * k + 1), 0)
-        mask = (mask / 255.0)[:, :, None]
-        merged = mask * bgr_fake.astype(np.float32) + (1 - mask) * img.astype(np.float32)
+        soft = cv2.GaussianBlur(inner, (2 * k + 1, 2 * k + 1), 0)
+        alpha = (soft / 255.0)[:, :, None]
+
+        fake = bgr_fake.astype(np.float32)
+        orig = img.astype(np.float32)
+        core = inner > 127                                    # pixels fully inside the face
+        if self.color_match and core.sum() > 200:
+            fake = _match_skin(fake, orig, core)
+        if self.sharpen > 0:
+            fake = _sharpen(fake, mask_size, self.sharpen)
+        if self.grain and core.sum() > 200:
+            fake = _match_grain(fake, orig, core)
+        merged = alpha * np.clip(fake, 0, 255) + (1 - alpha) * orig
         return merged.astype(np.uint8)
+
+
+def _match_skin(fake, orig, core):
+    """Move the swapped face's colour and contrast to the photo's own skin tone (LAB mean/std transfer)."""
+    f = cv2.cvtColor(np.clip(fake, 0, 255).astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
+    o = cv2.cvtColor(np.clip(orig, 0, 255).astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
+    out = f.copy()
+    for c in range(3):
+        fm, fs = f[..., c][core].mean(), f[..., c][core].std() + 1e-3
+        om, os_ = o[..., c][core].mean(), o[..., c][core].std() + 1e-3
+        gain = float(np.clip(os_ / fs, 0.7, 1.4))             # never over-flatten or over-stretch
+        out[..., c] = (f[..., c] - fm) * gain + om
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(out, cv2.COLOR_LAB2BGR).astype(np.float32)
+
+
+def _sharpen(fake, mask_size, amount):
+    """Unsharp mask; radius follows the face size so a big face is not under-sharpened."""
+    sigma = max(1.0, mask_size / 90.0)
+    blur = cv2.GaussianBlur(fake, (0, 0), sigma)
+    return fake + amount * (fake - blur)
+
+
+def _match_grain(fake, orig, core):
+    """The model output is noise-free; add the photo's own fine noise so the face does not look airbrushed."""
+    def hf(a):
+        g = cv2.cvtColor(np.clip(a, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float32)
+        return g - cv2.GaussianBlur(g, (0, 0), 1.2)
+    want = float(hf(orig)[core].std())
+    have = float(hf(fake)[core].std())
+    extra = (max(want * want - have * have, 0.0)) ** 0.5
+    if extra < 0.3:
+        return fake
+    rng = np.random.default_rng(1234)                         # fixed seed: same input, same output
+    noise = rng.normal(0.0, min(extra, 6.0), fake.shape[:2]).astype(np.float32)
+    return fake + noise[..., None]
 
 
 # --------------------------------------------------------------------------- facade
