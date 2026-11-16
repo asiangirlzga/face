@@ -11,12 +11,31 @@ android {
 
     defaultConfig {
         applicationId = "com.example.faceswapserver"
-        minSdk = 24
+        minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        // Every GitHub build gets a higher number, so a new APK installs OVER the old one (keeping the
+        // downloaded models) instead of being refused. Local builds use 1.
+        val run = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
+        versionCode = run
+        versionName = "2.$run"
         // Chaquopy's numpy/opencv wheels and ONNX Runtime are packaged for 64-bit ARM phones only.
         ndk { abiFilters += listOf("arm64-v8a") }
+    }
+
+    // One fixed signing key for every build. Android only installs an update when the signature matches the
+    // installed app; CI used to generate a new random debug key each run, which forced an uninstall (and
+    // deleted the models). Keep faceswap.keystore in the repo so every build is signed the same way.
+    signingConfigs {
+        create("shared") {
+            storeFile = rootProject.file("faceswap.keystore")
+            storePassword = "faceswap"
+            keyAlias = "faceswap"
+            keyPassword = "faceswap"
+        }
+    }
+    buildTypes {
+        getByName("debug") { signingConfig = signingConfigs.getByName("shared") }
+        getByName("release") { signingConfig = signingConfigs.getByName("shared") }
     }
 
     compileOptions {
@@ -46,4 +65,5 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.2")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }

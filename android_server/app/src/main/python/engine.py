@@ -277,8 +277,12 @@ def load_emap(onnx_path):
 
 class Swapper:
     SIZE = 128
+    # Face-shaped blend region in the 128px aligned crop: (cx, cy, rx, ry). It stays inside the skin so the
+    # generated hair/ear/background corners of the crop are never pasted back.
+    FACE = (64.0, 66.0, 38.0, 52.0)
+    FEATHER = 3.5          # blend edge softness, in 128px-crop pixels (scaled up to the photo)
 
-    def __init__(self, backend, path, color_match=True, sharpen=0.7, grain=True):
+    def __init__(self, backend, path, color_match=True, sharpen=0.8, grain=True):
         self.color_match, self.sharpen, self.grain = color_match, sharpen, grain
         self.backend = backend
         backend.load("swap", path)
@@ -289,68 +293,95 @@ class Swapper:
         lat /= np.linalg.norm(lat)
         return lat.astype(np.float32)
 
+    def _ellipse_mask(self, T, size, shrink=1.0):
+        """Hard 0..1 face ellipse (model space) warped into the photo ROI by the 2x3 matrix T."""
+        cx, cy, rx, ry = self.FACE
+        up = 4
+        big = np.zeros((self.SIZE * up, self.SIZE * up), np.uint8)
+        cv2.ellipse(big, (int(cx * up), int(cy * up)), (int(rx * shrink * up), int(ry * shrink * up)),
+                    0, 0, 360, 255, -1, cv2.LINE_AA)
+        T4 = T.copy()
+        T4[:, :2] = T[:, :2] / up
+        return cv2.warpAffine(big, T4, size, flags=cv2.INTER_LINEAR, borderValue=0).astype(np.float32) / 255.0
+
     def swap(self, img, kps, latent):
-        aimg, M = norm_crop(img, kps, self.SIZE)
-        blob = cv2.dnn.blobFromImage(aimg, 1.0 / 255.0, (self.SIZE, self.SIZE), (0, 0, 0), swapRB=True)
-        pred = self.backend.run("swap", [blob, latent])[0].reshape(1, 3, self.SIZE, self.SIZE)
-        fake = pred.transpose((0, 2, 3, 1))[0]
-        bgr_fake = np.clip(255 * fake, 0, 255).astype(np.uint8)[:, :, ::-1]
+        S = self.SIZE
+        aimg, M = norm_crop(img, kps, S)
+        blob = cv2.dnn.blobFromImage(aimg, 1.0 / 255.0, (S, S), (0, 0, 0), swapRB=True)
+        pred = self.backend.run("swap", [blob, latent])[0].reshape(1, 3, S, S)
+        fake128 = np.clip(255 * pred.transpose((0, 2, 3, 1))[0], 0, 255).astype(np.uint8)[:, :, ::-1]
 
         H, W = img.shape[:2]
-        IM = cv2.invertAffineTransform(M)
-        white = np.full((self.SIZE, self.SIZE), 255, dtype=np.float32)
-        # cubic resampling keeps the 128px face much sharper than the default bilinear upscale
-        bgr_fake = cv2.warpAffine(bgr_fake, IM, (W, H), flags=cv2.INTER_CUBIC, borderValue=0.0)
-        white = cv2.warpAffine(white, IM, (W, H), borderValue=0.0)
-        white[white > 20] = 255
-        mask = white
-        hs, ws = np.where(mask == 255)
-        if hs.size == 0:
+        IM = cv2.invertAffineTransform(M)                       # model px -> photo px
+        corners = np.array([[0, 0], [S, 0], [S, S], [0, S]], np.float64)
+        pts = corners @ IM[:, :2].T + IM[:, 2]
+        x0 = max(int(np.floor(pts[:, 0].min())) - 4, 0)
+        y0 = max(int(np.floor(pts[:, 1].min())) - 4, 0)
+        x1 = min(int(np.ceil(pts[:, 0].max())) + 4, W)
+        y1 = min(int(np.ceil(pts[:, 1].max())) + 4, H)
+        if x1 - x0 < 8 or y1 - y0 < 8:
             return img
-        mask_h, mask_w = hs.max() - hs.min(), ws.max() - ws.min()
-        mask_size = int(np.sqrt(mask_h * mask_w))
-        k = max(mask_size // 10, 10)
-        inner = cv2.erode(mask, np.ones((k, k), np.uint8), iterations=1)
-        k = max(mask_size // 20, 5)
-        soft = cv2.GaussianBlur(inner, (2 * k + 1, 2 * k + 1), 0)
-        alpha = (soft / 255.0)[:, :, None]
+        rw, rh = x1 - x0, y1 - y0
+        T = IM.copy()
+        T[0, 2] -= x0
+        T[1, 2] -= y0
+        scale = float(np.sqrt(abs(np.linalg.det(IM[:, :2]))))   # photo px per model px
 
-        fake = bgr_fake.astype(np.float32)
-        orig = img.astype(np.float32)
-        core = inner > 127                                    # pixels fully inside the face
-        if self.color_match and core.sum() > 200:
-            fake = _match_skin(fake, orig, core)
-        if self.sharpen > 0:
-            fake = _sharpen(fake, mask_size, self.sharpen)
-        if self.grain and core.sum() > 200:
-            fake = _match_grain(fake, orig, core)
+        fake = cv2.warpAffine(fake128, T, (rw, rh), flags=cv2.INTER_CUBIC,
+                              borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
+        orig = img[y0:y1, x0:x1].astype(np.float32)
+        inner = self._ellipse_mask(T, (rw, rh))
+        if inner.sum() < 50:
+            return img
+        sk = max(self.FEATHER * scale, 1.0)
+        alpha = cv2.GaussianBlur(inner, (0, 0), sk)[:, :, None]
+        stats = self._ellipse_mask(T, (rw, rh), 0.8)            # skin-only area used to measure tone
+
+        if scale > 1.6:                                         # remove the enlarged 128px pixel grid first
+            fake = cv2.GaussianBlur(fake, (0, 0), 0.4 * scale)
+        if self.color_match:
+            fake = _match_lighting(fake, orig, stats, scale)
+        if self.sharpen > 0 and scale > 1.0:                    # boost feature-sized detail, not the pixel grid
+            blur = cv2.GaussianBlur(fake, (0, 0), 0.9 * scale)
+            fake = fake + self.sharpen * (fake - blur)
+        if self.grain:
+            fake = _match_grain(fake, orig, stats > 0.5)
         merged = alpha * np.clip(fake, 0, 255) + (1 - alpha) * orig
-        return merged.astype(np.uint8)
+        out = img.copy()
+        out[y0:y1, x0:x1] = np.clip(merged + 0.5, 0, 255).astype(np.uint8)
+        return out
 
 
-def _match_skin(fake, orig, core):
-    """Move the swapped face's colour and contrast to the photo's own skin tone (LAB mean/std transfer)."""
-    f = cv2.cvtColor(np.clip(fake, 0, 255).astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
-    o = cv2.cvtColor(np.clip(orig, 0, 255).astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
-    out = f.copy()
+def _match_lighting(fake, orig, stats, scale):
+    """Make the swapped face's colour AND lighting gradient follow the photo's own skin.
+
+    Measures the smooth (low-frequency) colour of both faces over the skin area and adds the difference to the
+    swapped face. Unlike one global mean/std shift, a face lit from one side keeps that lighting, and the
+    difference fades smoothly, so no seam appears where the swapped face meets the photo."""
+    h, w = fake.shape[:2]
+    ds = max(1, int(min(h, w) / 160))                           # do the heavy blur on a small copy
+    sw_, sh_ = max(w // ds, 2), max(h // ds, 2)
+    def lab(a):
+        small = cv2.resize(a, (sw_, sh_), interpolation=cv2.INTER_AREA)
+        return cv2.cvtColor(np.clip(small, 0, 255).astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
+    f, o = lab(fake), lab(orig)
+    m = cv2.resize(stats, (sw_, sh_), interpolation=cv2.INTER_AREA)
+    sigma = max(10.0 * scale / ds, 2.0)
+    den = cv2.GaussianBlur(m, (0, 0), sigma) + 1e-4
+    corr = np.empty_like(f)
     for c in range(3):
-        fm, fs = f[..., c][core].mean(), f[..., c][core].std() + 1e-3
-        om, os_ = o[..., c][core].mean(), o[..., c][core].std() + 1e-3
-        gain = float(np.clip(os_ / fs, 0.7, 1.4))             # never over-flatten or over-stretch
-        out[..., c] = (f[..., c] - fm) * gain + om
-    out = np.clip(out, 0, 255).astype(np.uint8)
-    return cv2.cvtColor(out, cv2.COLOR_LAB2BGR).astype(np.float32)
-
-
-def _sharpen(fake, mask_size, amount):
-    """Unsharp mask; radius follows the face size so a big face is not under-sharpened."""
-    sigma = max(1.0, mask_size / 90.0)
-    blur = cv2.GaussianBlur(fake, (0, 0), sigma)
-    return fake + amount * (fake - blur)
+        corr[..., c] = (cv2.GaussianBlur(o[..., c] * m, (0, 0), sigma) -
+                        cv2.GaussianBlur(f[..., c] * m, (0, 0), sigma)) / den
+    corr = cv2.resize(corr, (w, h), interpolation=cv2.INTER_LINEAR)
+    fl = cv2.cvtColor(np.clip(fake, 0, 255).astype(np.uint8), cv2.COLOR_BGR2LAB).astype(np.float32)
+    fl = np.clip(fl + corr, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(fl, cv2.COLOR_LAB2BGR).astype(np.float32)
 
 
 def _match_grain(fake, orig, core):
     """The model output is noise-free; add the photo's own fine noise so the face does not look airbrushed."""
+    if core.sum() < 200:
+        return fake
     def hf(a):
         g = cv2.cvtColor(np.clip(a, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float32)
         return g - cv2.GaussianBlur(g, (0, 0), 1.2)
@@ -359,7 +390,7 @@ def _match_grain(fake, orig, core):
     extra = (max(want * want - have * have, 0.0)) ** 0.5
     if extra < 0.3:
         return fake
-    rng = np.random.default_rng(1234)                         # fixed seed: same input, same output
+    rng = np.random.default_rng(1234)                           # fixed seed: same input, same output
     noise = rng.normal(0.0, min(extra, 6.0), fake.shape[:2]).astype(np.float32)
     return fake + noise[..., None]
 

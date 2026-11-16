@@ -1,4 +1,4 @@
-package com.example.faceswap
+package com.example.faceswapserver
 
 import android.content.ContentResolver
 import android.content.ContentValues
@@ -27,7 +27,7 @@ data class JobStatus(
     val skipped: List<String>,
 )
 
-/** Talks to server.py running in Google Colab. */
+/** Talks to the engine (server.py) that runs inside this same app, over localhost. */
 class SwapApi(baseUrl: String, private val token: String) {
     private val base = baseUrl.trim().trimEnd('/')
 
@@ -36,6 +36,20 @@ class SwapApi(baseUrl: String, private val token: String) {
         .writeTimeout(15, TimeUnit.MINUTES)
         .readTimeout(15, TimeUnit.MINUTES)
         .build()
+
+    /** The engine state ("ready", "loading", "missing", "error") and its error text, or null when nothing listens yet. */
+    fun health(): Pair<String, String?>? {
+        val quick = http.newBuilder().connectTimeout(2, TimeUnit.SECONDS).readTimeout(4, TimeUnit.SECONDS).build()
+        return try {
+            quick.newCall(Request.Builder().url("$base/health").build()).execute().use { r ->
+                if (!r.isSuccessful) return null
+                val j = JSONObject(r.body!!.string())
+                Pair(j.optString("engine", ""), if (j.isNull("error")) null else j.optString("error"))
+            }
+        } catch (e: IOException) {
+            null
+        }
+    }
 
     private fun uriBody(cr: ContentResolver, uri: Uri, mime: String): RequestBody =
         object : RequestBody() {

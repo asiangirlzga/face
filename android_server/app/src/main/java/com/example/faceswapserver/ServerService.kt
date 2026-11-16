@@ -47,10 +47,7 @@ class ServerService : Service() {
                 ServerState.running = true
                 startPolling(server)
                 val work = File(cacheDir, "jobs").absolutePath
-                server.callAttr(
-                    "serve", host, port, token, ModelStore.dir(this).absolutePath, work,
-                    SdModelStore.dir(this).absolutePath,   // image model folder for POST /jobs/text2img
-                )  // blocks
+                server.callAttr("serve", host, port, token, ModelStore.dir(this).absolutePath, work)  // blocks
             } catch (t: Throwable) {
                 ServerState.error = t.message ?: t.toString()
             } finally {
@@ -112,7 +109,7 @@ class ServerService : Service() {
     private fun notification(text: String): Notification {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= 26 && nm.getNotificationChannel(CHANNEL) == null) {
-            nm.createNotificationChannel(NotificationChannel(CHANNEL, "Face swap server", NotificationManager.IMPORTANCE_LOW))
+            nm.createNotificationChannel(NotificationChannel(CHANNEL, "Face Swap engine", NotificationManager.IMPORTANCE_LOW))
         }
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
@@ -122,7 +119,7 @@ class ServerService : Service() {
         )
         return NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle("Face Swap Server")
+            .setContentTitle("Face Swap engine")
             .setContentText(text)
             .setContentIntent(open)
             .addAction(0, "Stop", stop)

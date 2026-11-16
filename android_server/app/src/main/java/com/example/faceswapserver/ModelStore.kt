@@ -8,7 +8,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.zip.ZipInputStream
 
-/** Downloads the three ONNX models into app storage (resumable). */
+/** Downloads the three ONNX models into app storage (resumable). Files already present are never downloaded again. */
 object ModelStore {
     const val DET = "det_10g.onnx"
     const val REC = "w600k_r50.onnx"
@@ -29,6 +29,8 @@ object ModelStore {
         val f = File(dir(ctx), name)
         return f.isFile && f.length() >= (MIN_SIZE[name] ?: 1L)
     }
+
+    fun allPresent(ctx: Context): Boolean = has(ctx, DET) && has(ctx, REC) && has(ctx, SWAP)
 
     /** progress(label, doneBytes, totalBytes) */
     fun downloadAll(ctx: Context, customSwapUrl: String, progress: (String, Long, Long) -> Unit) {

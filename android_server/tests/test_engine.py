@@ -73,7 +73,7 @@ def main(models):
             blob = arrays[0]; out = np.clip(blob * 0.5 + 0.4, 0, 1)  # visibly different face region
             return [out.astype(np.float32).reshape(-1)]
     sw = E.Swapper.__new__(E.Swapper); sw.backend = FakeBE(); sw.emap = np.eye(512, dtype=np.float32)
-    sw.color_match, sw.sharpen, sw.grain = True, 0.7, True
+    sw.color_match, sw.sharpen, sw.grain = True, 0.8, True
     lat = sw.latent(e1); assert lat.shape == (1, 512)
     out = sw.swap(img, f.kps, lat)
     diff = np.abs(out.astype(int) - img.astype(int)).sum(2)
@@ -98,11 +98,27 @@ def main(models):
     # sharpening: matched output is at least as crisp as the unsharpened one (Laplacian variance inside the face)
     sw.backend = FakeBE()
     sw.sharpen = 0.0; soft = sw.swap(img, f.kps, lat)
-    sw.sharpen = 0.7; crisp = sw.swap(img, f.kps, lat)
+    sw.sharpen = 0.8; crisp = sw.swap(img, f.kps, lat)
     lv = lambda im: cv2.Laplacian(cv2.cvtColor(im[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY), cv2.CV_64F).var()
     print("laplacian var soft", round(lv(soft), 1), "crisp", round(lv(crisp), 1))
     assert lv(crisp) >= lv(soft)
     assert np.array_equal(sw.swap(img, f.kps, lat), crisp)    # deterministic
+    # seam: with a constant-gray stand-in face on a flat photo, the blend weight must fade out smoothly (no hard edge)
+    class GrayBE(FakeBE):
+        def run(self, name, arrays):
+            return [np.full(3 * 128 * 128, 0.2, np.float32)]
+    sw.backend = GrayBE(); sw.color_match = False; sw.sharpen = 0.0; sw.grain = False
+    flat = np.full(img.shape, 200, np.uint8)
+    alpha = (200.0 - sw.swap(flat, f.kps, lat)[..., 0].astype(np.float32)) / (200.0 - 51.0)
+    step = max(np.abs(np.diff(alpha, axis=0)).max(), np.abs(np.diff(alpha, axis=1)).max())
+    print("blend: max alpha", round(float(alpha.max()), 3), "min", round(float(alpha.min()), 3), "largest step", round(float(step), 3))
+    assert alpha.max() > 0.98 and alpha.min() < 0.01 and step < 0.12
+    assert alpha[: max(y1 - 80, 1), :].max() < 0.01              # nothing far from the face
+    # face partly outside the photo (ROI clipped at the border) must not crash or change the shape
+    shifted = f.kps - np.array([x1 - 6, y1 - 6], np.float32)
+    edge_img = img[:, x1 - 6:].copy()
+    assert sw.swap(edge_img, shifted, lat).shape == edge_img.shape
+    assert sw.swap(edge_img[:60, :60].copy(), shifted, lat).shape == (60, 60, 3)
     # blank image: no faces
     assert det.detect(np.full((480, 640, 3), 127, np.uint8)) == []
     print("ALL OK")
